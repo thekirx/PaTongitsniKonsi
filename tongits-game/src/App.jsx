@@ -182,7 +182,7 @@ function maskGameStateForViewer(gameState, viewerPlayerIndex) {
   return {
     ...gameState,
     selectedCardIds: [],
-    players: gameState.players.map((player) => ({
+    players: gameState.players.map((player, playerIndex) => ({
       ...player,
       hand: playerIndex === viewerPlayerIndex ? player.hand : [],
     })),
