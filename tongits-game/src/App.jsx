@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { createClient } from '@supabase/supabase-js'
 import './App.css'
 
@@ -6,6 +6,7 @@ const PLAYER_NAMES = ['Player 1', 'Player 2', 'Player 3']
 const HUMAN_INDEX = 0
 const SUITS = ['♣', '♦', '♥', '♠']
 const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K']
+const TURN_SECONDS = 30
 const RANK_VALUES = {
   A: 1,
   2: 2,
@@ -93,9 +94,9 @@ function assertUniqueCardIds(cards, context) {
 }
 
 function addUniqueCardToHand(hand, card) {
-  if (hand.some((heldCard) => heldCard.id === card.id)) return sortCards(hand)
+  if (hand.some((heldCard) => heldCard.id === card.id)) return hand
 
-  return sortCards([...hand, card])
+  return [...hand, card]
 }
 
 function normalizeUniqueCards(cards) {
@@ -126,8 +127,202 @@ function sortCards(cards) {
   return [...cards].sort((first, second) => {
     if (first.suit !== second.suit) return SUITS.indexOf(first.suit) - SUITS.indexOf(second.suit)
 
-    return RANK_VALUES[first.rank] - RANK_VALUES[second.rank]
+    return RANK_VALUES[second.rank] - RANK_VALUES[first.rank]
   })
+}
+
+function sortByDeadwood(cards) {
+  return [...cards].sort((first, second) => {
+    const deadwoodDifference = DEADWOOD_VALUES[second.rank] - DEADWOOD_VALUES[first.rank]
+    if (deadwoodDifference !== 0) return deadwoodDifference
+    if (RANK_VALUES[second.rank] !== RANK_VALUES[first.rank]) return RANK_VALUES[second.rank] - RANK_VALUES[first.rank]
+
+    return SUITS.indexOf(first.suit) - SUITS.indexOf(second.suit)
+  })
+}
+
+function groupCardsByRank(cards) {
+  return cards.reduce((groups, card) => {
+    const rankCards = groups.get(card.rank) ?? []
+    groups.set(card.rank, [...rankCards, card])
+
+    return groups
+  }, new Map())
+}
+
+function groupCardsBySuit(cards) {
+  return cards.reduce((groups, card) => {
+    const suitCards = groups.get(card.suit) ?? []
+    groups.set(card.suit, [...suitCards, card])
+
+    return groups
+  }, new Map())
+}
+
+function removeUsedCards(cards, usedCardIds) {
+  return cards.filter((card) => !usedCardIds.has(card.id))
+}
+
+function createHandGroup(type, cards) {
+  return {
+    id: `${type}-${cards.map((card) => card.id).join('-')}-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    cardIds: cards.map((card) => card.id),
+    type,
+  }
+}
+
+function findBahayMelds(hand) {
+  const melds = []
+  let remainingCards = [...hand]
+  const usedCardIds = new Set()
+
+  const rankGroups = [...groupCardsByRank(remainingCards).values()]
+    .filter((cards) => cards.length >= 3)
+    .map((cards) => sortCards(cards).slice(0, 4))
+    .sort((first, second) => second.length - first.length || DEADWOOD_VALUES[second[0].rank] - DEADWOOD_VALUES[first[0].rank])
+
+  for (const rankGroup of rankGroups) {
+    if (rankGroup.some((card) => usedCardIds.has(card.id))) continue
+
+    melds.push(rankGroup)
+    rankGroup.forEach((card) => usedCardIds.add(card.id))
+  }
+
+  remainingCards = removeUsedCards(remainingCards, usedCardIds)
+
+  for (const suitCards of groupCardsBySuit(remainingCards).values()) {
+    const orderedCards = [...suitCards].sort((first, second) => RANK_VALUES[first.rank] - RANK_VALUES[second.rank])
+    let run = []
+
+    for (const card of orderedCards) {
+      const previousCard = run.at(-1)
+
+      if (!previousCard || RANK_VALUES[card.rank] === RANK_VALUES[previousCard.rank] + 1) {
+        run.push(card)
+      } else {
+        if (run.length >= 3) {
+          melds.push(sortCards(run))
+          run.forEach((runCard) => usedCardIds.add(runCard.id))
+        }
+        run = [card]
+      }
+    }
+
+    if (run.length >= 3) {
+      melds.push(sortCards(run))
+      run.forEach((runCard) => usedCardIds.add(runCard.id))
+    }
+  }
+
+  return {
+    melds,
+    remainingCards: removeUsedCards(hand, usedCardIds),
+  }
+}
+
+function findTwaites(hand) {
+  const twaites = []
+  let remainingCards = [...hand]
+  const usedCardIds = new Set()
+
+  const pairs = [...groupCardsByRank(remainingCards).values()]
+    .filter((cards) => cards.length === 2)
+    .map((cards) => sortCards(cards))
+    .sort((first, second) => DEADWOOD_VALUES[second[0].rank] - DEADWOOD_VALUES[first[0].rank])
+
+  for (const pair of pairs) {
+    if (pair.some((card) => usedCardIds.has(card.id))) continue
+
+    twaites.push(pair)
+    pair.forEach((card) => usedCardIds.add(card.id))
+  }
+
+  remainingCards = removeUsedCards(remainingCards, usedCardIds)
+
+  for (const suitCards of groupCardsBySuit(remainingCards).values()) {
+    const orderedCards = [...suitCards].sort((first, second) => RANK_VALUES[first.rank] - RANK_VALUES[second.rank])
+
+    for (let index = 0; index < orderedCards.length - 1; index += 1) {
+      const first = orderedCards[index]
+      if (usedCardIds.has(first.id)) continue
+
+      const mate = orderedCards
+        .slice(index + 1)
+        .find((candidate) => !usedCardIds.has(candidate.id) && RANK_VALUES[candidate.rank] - RANK_VALUES[first.rank] <= 2)
+
+      if (!mate) continue
+
+      const twaitesGroup = sortCards([first, mate])
+      twaites.push(twaitesGroup)
+      twaitesGroup.forEach((card) => usedCardIds.add(card.id))
+    }
+  }
+
+  return {
+    remainingCards: removeUsedCards(hand, usedCardIds),
+    twaites,
+  }
+}
+
+function handleAutoSort(hand) {
+  const { melds, remainingCards: afterMelds } = findBahayMelds(hand)
+  const { twaites, remainingCards } = findTwaites(afterMelds)
+  const deadwood = sortByDeadwood(remainingCards)
+  const orderedGroups = [
+    ...melds.map((cards) => ({ cards: sortCards(cards), type: 'meld' })),
+    ...twaites.map((cards) => ({ cards: sortCards(cards), type: 'twaite' })),
+  ]
+  const handGroups = orderedGroups.map((group) => createHandGroup(group.type, group.cards))
+
+  return {
+    hand: [...orderedGroups.flatMap((group) => group.cards), ...deadwood],
+    handGroups,
+  }
+}
+
+function getHandRenderGroups(hand, handGroups = []) {
+  const cardById = new Map(hand.map((card) => [card.id, card]))
+  const usedCardIds = new Set()
+  const renderGroups = []
+
+  for (const group of handGroups) {
+    const cards = group.cardIds.map((cardId) => cardById.get(cardId)).filter(Boolean)
+
+    if (cards.length < 2 || cards.some((card) => usedCardIds.has(card.id))) continue
+
+    cards.forEach((card) => usedCardIds.add(card.id))
+    renderGroups.push({
+      ...group,
+      cards,
+    })
+  }
+
+  for (const card of hand) {
+    if (usedCardIds.has(card.id)) continue
+
+    renderGroups.push({
+      cards: [card],
+      id: `single-${card.id}`,
+      type: 'single',
+    })
+  }
+
+  return renderGroups
+}
+
+function moveCardInHand(hand, draggedCardId, targetCardId) {
+  if (draggedCardId === targetCardId) return hand
+
+  const nextHand = [...hand]
+  const fromIndex = nextHand.findIndex((card) => card.id === draggedCardId)
+  const toIndex = nextHand.findIndex((card) => card.id === targetCardId)
+
+  if (fromIndex === -1 || toIndex === -1) return hand
+
+  const [draggedCard] = nextHand.splice(fromIndex, 1)
+  nextHand.splice(toIndex, 0, draggedCard)
+
+  return nextHand
 }
 
 function formatCard(card) {
@@ -143,6 +338,7 @@ function createPlayer(name, seatIndex) {
     name,
     seatIndex,
     hand: [],
+    handGroups: [],
     exposedMelds: [],
     isOpened: false,
     isSapawed: false,
@@ -174,6 +370,7 @@ function buildNewGame() {
     currentPlayerIndex: 0,
     phase: 'meld',
     selectedCardIds: [],
+    newlyDrawnCardId: null,
     pendingDiscardDrawId: null,
     turnSelfConnected: false,
     lastStockTakerIndex: null,
@@ -215,8 +412,91 @@ function getSelectedCards(hand, selectedCardIds) {
   return hand.filter((card) => selectedCardIds.includes(card.id))
 }
 
+function pruneHandGroups(handGroups = [], hand) {
+  const handCardIds = new Set(hand.map((card) => card.id))
+
+  return handGroups
+    .map((group) => ({
+      ...group,
+      cardIds: group.cardIds.filter((cardId) => handCardIds.has(cardId)),
+    }))
+    .filter((group) => group.cardIds.length > 1)
+}
+
 function removeCards(hand, cardIds) {
   return hand.filter((card) => !cardIds.includes(card.id))
+}
+
+function getAllTrackedCards(gameState) {
+  return [
+    ...gameState.stockPile,
+    ...gameState.discardPile,
+    ...gameState.players.flatMap((player) => player.hand),
+    ...gameState.players.flatMap((player) => player.exposedMelds.flat()),
+  ]
+}
+
+function validateCardConservation(gameState) {
+  const allCards = getAllTrackedCards(gameState)
+  const cardIds = allCards.map((card) => card.id)
+  const duplicateIds = cardIds.filter((cardId, index) => cardIds.indexOf(cardId) !== index)
+
+  return {
+    duplicateIds: [...new Set(duplicateIds)],
+    isValid: allCards.length === 52 && duplicateIds.length === 0,
+    totalCards: allCards.length,
+  }
+}
+
+function assertCardConservation(gameState, context) {
+  const result = validateCardConservation(gameState)
+
+  if (!result.isValid) {
+    throw new Error(
+      `${context} broke card conservation. Count=${result.totalCards}; duplicates=${result.duplicateIds.join(', ') || 'none'}`,
+    )
+  }
+}
+
+function moveTopStockCardToHand(gameState, playerIndex) {
+  const [drawnCard, ...stockPile] = gameState.stockPile
+  if (!drawnCard) return gameState
+
+  const players = gameState.players.map((player, index) =>
+    index === playerIndex
+      ? {
+          ...player,
+          hand: addUniqueCardToHand(player.hand, drawnCard),
+        }
+      : player,
+  )
+
+  return {
+    ...gameState,
+    players,
+    stockPile,
+  }
+}
+
+function moveTopDiscardCardToHand(gameState, playerIndex) {
+  const drawnCard = gameState.discardPile.at(-1)
+  if (!drawnCard) return gameState
+
+  const discardPile = gameState.discardPile.slice(0, -1)
+  const players = gameState.players.map((player, index) =>
+    index === playerIndex
+      ? {
+          ...player,
+          hand: addUniqueCardToHand(player.hand, drawnCard),
+        }
+      : player,
+  )
+
+  return {
+    ...gameState,
+    discardPile,
+    players,
+  }
 }
 
 function maskGameStateForViewer(gameState, viewerPlayerIndex) {
@@ -225,6 +505,7 @@ function maskGameStateForViewer(gameState, viewerPlayerIndex) {
     selectedCardIds: [],
     players: gameState.players.map((player, playerIndex) => ({
       ...player,
+      handGroups: playerIndex === viewerPlayerIndex ? player.handGroups : [],
       hand: playerIndex === viewerPlayerIndex ? player.hand : [],
     })),
   }
@@ -236,6 +517,7 @@ function buildPublicGameState(gameState) {
     selectedCardIds: [],
     players: gameState.players.map((player) => ({
       ...player,
+      handGroups: [],
       hand: [],
     })),
   }
@@ -247,6 +529,7 @@ function mergePublicGameStateWithPrivateHand(currentGameState, publicGameState, 
     selectedCardIds: [],
     players: publicGameState.players.map((player, playerIndex) => ({
       ...player,
+      handGroups: playerIndex === viewerPlayerIndex ? currentGameState.players[playerIndex]?.handGroups ?? [] : [],
       hand: playerIndex === viewerPlayerIndex ? currentGameState.players[playerIndex]?.hand ?? player.hand : [],
     })),
   }
@@ -397,27 +680,18 @@ function drawFromStock(gameState, playerIndex) {
   if (gameState.stockPile.length === 0) return resolveDeckDepletion(gameState, gameState.lastStockTakerIndex)
 
   const drawnCard = gameState.stockPile[0]
-  const stockPile = gameState.stockPile.slice(1)
-  const players = gameState.players.map((player, index) =>
-    index === playerIndex
-      ? {
-          ...player,
-          hand: addUniqueCardToHand(player.hand, drawnCard),
-        }
-      : player,
-  )
+  const movedState = moveTopStockCardToHand(gameState, playerIndex)
   const nextState = {
-    ...gameState,
-    players,
-    stockPile,
+    ...movedState,
     phase: 'meld',
     selectedCardIds: [],
+    newlyDrawnCardId: drawnCard?.id ?? null,
     lastStockTakerIndex: playerIndex,
-    message: `${players[playerIndex].name} drew from the stock pile.`,
-    log: appendLog(gameState, `${players[playerIndex].name} drew from stock.`),
+    message: `${movedState.players[playerIndex].name} drew from the stock pile.`,
+    log: appendLog(gameState, `${movedState.players[playerIndex].name} drew from stock.`),
   }
 
-  if (stockPile.length === 0) return resolveDeckDepletion(nextState, playerIndex)
+  if (movedState.stockPile.length === 0) return resolveDeckDepletion(nextState, playerIndex)
 
   return nextState
 }
@@ -426,25 +700,16 @@ function drawFromDiscard(gameState, playerIndex) {
   if (gameState.phase !== 'preDraw' || gameState.discardPile.length === 0) return gameState
 
   const drawnCard = gameState.discardPile.at(-1)
-  const discardPile = gameState.discardPile.slice(0, -1)
-  const players = gameState.players.map((player, index) =>
-    index === playerIndex
-      ? {
-          ...player,
-          hand: addUniqueCardToHand(player.hand, drawnCard),
-        }
-      : player,
-  )
+  const movedState = moveTopDiscardCardToHand(gameState, playerIndex)
 
   return {
-    ...gameState,
-    players,
-    discardPile,
+    ...movedState,
     phase: 'meld',
     pendingDiscardDrawId: drawnCard.id,
     selectedCardIds: [drawnCard.id],
-    message: `${players[playerIndex].name} took ${formatCard(drawnCard)} from discard. It must be used in a new exposed meld.`,
-    log: appendLog(gameState, `${players[playerIndex].name} drew ${formatCard(drawnCard)} from discard.`),
+    newlyDrawnCardId: null,
+    message: `${movedState.players[playerIndex].name} took ${formatCard(drawnCard)} from discard. It must be used in a new exposed meld.`,
+    log: appendLog(gameState, `${movedState.players[playerIndex].name} drew ${formatCard(drawnCard)} from discard.`),
   }
 }
 
@@ -469,12 +734,17 @@ function exposeSelectedMeld(gameState, playerIndex) {
 
   const players = gameState.players.map((currentPlayer, index) =>
     index === playerIndex
-      ? {
-          ...currentPlayer,
-          hand: removeCards(currentPlayer.hand, gameState.selectedCardIds),
-          exposedMelds: [...currentPlayer.exposedMelds, sortCards(selectedCards)],
-          isOpened: true,
-        }
+      ? (() => {
+          const hand = removeCards(currentPlayer.hand, gameState.selectedCardIds)
+
+          return {
+            ...currentPlayer,
+            hand,
+            handGroups: pruneHandGroups(currentPlayer.handGroups, hand),
+            exposedMelds: [...currentPlayer.exposedMelds, sortCards(selectedCards)],
+            isOpened: true,
+          }
+        })()
       : currentPlayer,
   )
 
@@ -482,6 +752,7 @@ function exposeSelectedMeld(gameState, playerIndex) {
     ...gameState,
     players,
     selectedCardIds: [],
+    newlyDrawnCardId: null,
     pendingDiscardDrawId: null,
     message: `${players[playerIndex].name} opened a ${validation.type}.`,
     log: appendLog(gameState, `${players[playerIndex].name} exposed ${selectedCards.map(formatCard).join(' ')}.`),
@@ -520,9 +791,12 @@ function sapawSelectedCard(gameState, targetPlayerIndex, meldIndex) {
 
   const players = gameState.players.map((currentPlayer, index) => {
     if (index === playerIndex) {
+      const hand = removeCards(currentPlayer.hand, [selectedCard.id])
+
       return {
         ...currentPlayer,
-        hand: removeCards(currentPlayer.hand, [selectedCard.id]),
+        hand,
+        handGroups: pruneHandGroups(currentPlayer.handGroups, hand),
       }
     }
 
@@ -541,6 +815,7 @@ function sapawSelectedCard(gameState, targetPlayerIndex, meldIndex) {
     ...gameState,
     players,
     selectedCardIds: [],
+    newlyDrawnCardId: null,
     turnSelfConnected: targetPlayerIndex === playerIndex || gameState.turnSelfConnected,
     message: `${PLAYER_NAMES[playerIndex]} connected ${formatCard(selectedCard)} to ${PLAYER_NAMES[targetPlayerIndex]}'s meld.`,
     log: appendLog(gameState, `${PLAYER_NAMES[playerIndex]} sapawed ${formatCard(selectedCard)}.`),
@@ -570,10 +845,15 @@ function discardSelectedCard(gameState, playerIndex) {
   const discardedCard = selectedCards[0]
   const players = gameState.players.map((currentPlayer, index) =>
     index === playerIndex
-      ? {
-          ...currentPlayer,
-          hand: removeCards(currentPlayer.hand, [discardedCard.id]),
-        }
+      ? (() => {
+          const hand = removeCards(currentPlayer.hand, [discardedCard.id])
+
+          return {
+            ...currentPlayer,
+            hand,
+            handGroups: pruneHandGroups(currentPlayer.handGroups, hand),
+          }
+        })()
       : currentPlayer,
   )
 
@@ -583,6 +863,7 @@ function discardSelectedCard(gameState, playerIndex) {
       players,
       discardPile: [...gameState.discardPile, discardedCard],
       phase: 'discard',
+      newlyDrawnCardId: null,
     },
     playerIndex,
     discardedCard,
@@ -667,6 +948,54 @@ function findSapawTarget(gameState, playerIndex) {
 
 function chooseDiscard(hand) {
   return [...hand].sort((first, second) => DEADWOOD_VALUES[second.rank] - DEADWOOD_VALUES[first.rank])[0]
+}
+
+function runTimeoutMove(gameState, playerIndex) {
+  if (gameState.phase === 'gameOver') return gameState
+
+  if (gameState.phase === 'preDraw') {
+    if (gameState.stockPile.length > 0) {
+      return runTimeoutMove(drawFromStock(gameState, playerIndex), playerIndex)
+    }
+    if (gameState.discardPile.length > 0) {
+      return runTimeoutMove(drawFromDiscard(gameState, playerIndex), playerIndex)
+    }
+
+    return gameState
+  }
+
+  let nextState = gameState
+
+  if (nextState.pendingDiscardDrawId) {
+    const forcedMeld = findFirstMeld(nextState.players[playerIndex].hand, nextState.pendingDiscardDrawId)
+
+    if (forcedMeld) {
+      nextState = exposeSelectedMeld(
+        {
+          ...nextState,
+          selectedCardIds: forcedMeld.map((card) => card.id),
+        },
+        playerIndex,
+      )
+    } else {
+      return {
+        ...nextState,
+        message: `${PLAYER_NAMES[playerIndex]} timed out but must expose the discard card before ending the turn.`,
+      }
+    }
+  }
+
+  const discardCard = chooseDiscard(nextState.players[playerIndex].hand)
+
+  if (!discardCard) return nextState
+
+  return discardSelectedCard(
+    {
+      ...nextState,
+      selectedCardIds: [discardCard.id],
+    },
+    playerIndex,
+  )
 }
 
 function runCpuTurn(gameState) {
@@ -754,13 +1083,14 @@ function normalizeRoomCode(value) {
   return value.replace(/[^a-z0-9]/gi, '').toUpperCase().slice(0, 4)
 }
 
-function CardButton({ card, isSelected, onClick, className = '', style }) {
+function CardButton({ card, isSelected, onClick, className = '', style, ...buttonProps }) {
   return (
     <button
       className={`card ${isRedSuit(card) ? 'red' : 'black'} ${isSelected ? 'selected' : ''} ${className}`}
       onClick={onClick}
       style={style}
       type="button"
+      {...buttonProps}
     >
       <span>{card.rank}</span>
       <strong>{card.suit}</strong>
@@ -773,6 +1103,35 @@ function MiniCard({ card }) {
     <span className={`mini-card ${isRedSuit(card) ? 'red' : 'black'}`}>
       {formatCard(card)}
     </span>
+  )
+}
+
+function DiscardHistoryModal({ cards, onClose }) {
+  if (cards.length === 0) return null
+
+  return (
+    <section className="discard-modal-backdrop" aria-label="Discard pile history" role="dialog">
+      <div className="discard-modal">
+        <header>
+          <div>
+            <span>Discard History</span>
+            <strong>Oldest to newest</strong>
+          </div>
+          <button onClick={onClose} type="button">
+            Close
+          </button>
+        </header>
+
+        <div className="discard-history-grid">
+          {cards.map((card, index) => (
+            <div className="discard-history-item" key={`${card.id}-${index}`}>
+              <MiniCard card={card} />
+              <span>{index === cards.length - 1 ? 'Top discard' : `#${index + 1}`}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
   )
 }
 
@@ -790,6 +1149,9 @@ function TongitsGame({
   roomChannel,
 }) {
   const [gameState, setGameState] = useState(buildNewGame)
+  const [discardHistorySnapshot, setDiscardHistorySnapshot] = useState([])
+  const [draggedCardId, setDraggedCardId] = useState(null)
+  const [turnSeconds, setTurnSeconds] = useState(TURN_SECONDS)
 
   const currentPlayer = gameState.players[gameState.currentPlayerIndex]
   const myPlayerIndex = appMode === 'multiplayer' ? getPlayerIndexFromRole(myRole) : HUMAN_INDEX
@@ -799,10 +1161,31 @@ function TongitsGame({
     [gameState.selectedCardIds, humanPlayer.hand],
   )
   const topDiscard = gameState.discardPile.at(-1)
+  const conservationStatus = validateCardConservation(gameState)
   const isHumanTurn = gameState.currentPlayerIndex === myPlayerIndex && gameState.phase !== 'gameOver'
   const selectedMeldStatus = validateMeld(selectedCards)
+  const isGameLive = gameState.phase !== 'gameOver' && (appMode === 'solo' || multiplayerDealStarted)
+  const handRenderGroups = useMemo(
+    () => getHandRenderGroups(humanPlayer.hand, humanPlayer.handGroups),
+    [humanPlayer.hand, humanPlayer.handGroups],
+  )
+  const selectedCardData = useMemo(
+    () => ({
+      cards: selectedCards,
+      ids: selectedCards.map((card) => card.id),
+      labels: selectedCards.map(formatCard),
+    }),
+    [selectedCards],
+  )
+  const canExposeSelection = isHumanTurn && gameState.phase === 'meld' && selectedMeldStatus.valid
+  const canDiscardSelection = isHumanTurn && gameState.phase === 'meld' && gameState.selectedCardIds.length === 1
+  const canGroupSelection = isHumanTurn && gameState.selectedCardIds.length > 1
+  const opponentPlayers = gameState.players.filter((_, playerIndex) => playerIndex !== myPlayerIndex)
+  const handCardCount = humanPlayer.hand.length
+  const handScale = Math.max(0.76, Math.min(1, 1 - Math.max(handCardCount - 13, 0) * 0.035))
+  const handOverlap = Math.min(42, Math.max(18, 18 + Math.max(handCardCount - 10, 0) * 3))
 
-  async function broadcastGameMove(nextGameState, moveType = 'turn-step') {
+  const broadcastGameMove = useCallback(async (nextGameState, moveType = 'turn-step') => {
     if (appMode !== 'multiplayer' || !roomChannel) return
     const publicGameState = buildPublicGameState(nextGameState)
 
@@ -819,7 +1202,46 @@ function TongitsGame({
       },
       type: 'broadcast',
     })
+  }, [appMode, myRole, playerName, roomChannel, roomCode])
+
+  const commitGameState = useCallback((reducer, moveType) => {
+    setGameState((previousState) => {
+      const nextGameState = reducer(previousState)
+
+      if (appMode === 'solo') {
+        assertCardConservation(nextGameState, moveType)
+      } else {
+        assertUniqueCardIds(getAllTrackedCards(nextGameState), `${moveType} known cards`)
+      }
+
+      if (appMode === 'multiplayer') {
+        void broadcastGameMove(nextGameState, moveType)
+      }
+
+      return nextGameState
+    })
+  }, [appMode, broadcastGameMove])
+
+  function openDiscardHistory() {
+    setDiscardHistorySnapshot([...gameState.discardPile])
   }
+
+  function closeDiscardHistory() {
+    setDiscardHistorySnapshot([])
+  }
+
+  useEffect(() => {
+    if (!gameState.newlyDrawnCardId) return undefined
+
+    const timeoutId = window.setTimeout(() => {
+      setGameState((previousState) => ({
+        ...previousState,
+        newlyDrawnCardId: null,
+      }))
+    }, 2600)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [gameState.newlyDrawnCardId])
 
   useEffect(() => {
     if (appMode !== 'solo') return undefined
@@ -831,6 +1253,26 @@ function TongitsGame({
 
     return () => window.clearTimeout(timeoutId)
   }, [appMode, gameState])
+
+  useEffect(() => {
+    setTurnSeconds(TURN_SECONDS)
+  }, [gameState.currentPlayerIndex, gameState.dealId])
+
+  useEffect(() => {
+    if (!isGameLive) return undefined
+
+    const intervalId = window.setInterval(() => {
+      setTurnSeconds((seconds) => Math.max(seconds - 1, 0))
+    }, 1000)
+
+    return () => window.clearInterval(intervalId)
+  }, [isGameLive, gameState.currentPlayerIndex, gameState.dealId])
+
+  useEffect(() => {
+    if (!isGameLive || !isHumanTurn || turnSeconds > 0) return
+
+    commitGameState((previousState) => runTimeoutMove(previousState, myPlayerIndex), 'timeout')
+  }, [commitGameState, isGameLive, isHumanTurn, myPlayerIndex, turnSeconds])
 
   useEffect(() => {
     if (appMode !== 'multiplayer' || !roomChannel) return undefined
@@ -887,18 +1329,6 @@ function TongitsGame({
     }
   }, [appMode, onMultiplayerDealStarted, presenceKey, roomCode])
 
-  function commitGameState(reducer, moveType) {
-    setGameState((previousState) => {
-      const nextGameState = reducer(previousState)
-
-      if (appMode === 'multiplayer') {
-        void broadcastGameMove(nextGameState, moveType)
-      }
-
-      return nextGameState
-    })
-  }
-
   async function startMultiplayerDeal() {
     if (appMode !== 'multiplayer' || myRole !== 'Player 1' || connectedPlayers.length !== 3) return
 
@@ -931,14 +1361,138 @@ function TongitsGame({
 
       return {
         ...previousState,
+        newlyDrawnCardId: null,
         selectedCardIds,
       }
     })
   }
 
+  function autoSortHand() {
+    setGameState((previousState) => ({
+      ...previousState,
+      players: previousState.players.map((player, playerIndex) =>
+        playerIndex === myPlayerIndex
+          ? (() => {
+              const sorted = handleAutoSort(player.hand)
+
+              return {
+                ...player,
+                hand: sorted.hand,
+                handGroups: sorted.handGroups,
+              }
+            })()
+          : player,
+      ),
+      newlyDrawnCardId: null,
+      selectedCardIds: [],
+    }))
+  }
+
+  function groupSelectedCards() {
+    if (!canGroupSelection) return
+
+    setGameState((previousState) => ({
+      ...previousState,
+      players: previousState.players.map((player, playerIndex) =>
+        playerIndex === myPlayerIndex
+          ? (() => {
+              const selectedCardIds = new Set(previousState.selectedCardIds)
+              const selectedGroupCards = player.hand.filter((card) => selectedCardIds.has(card.id))
+              const unselectedCards = player.hand.filter((card) => !selectedCardIds.has(card.id))
+              const firstSelectedIndex = player.hand.findIndex((card) => selectedCardIds.has(card.id))
+              const insertIndex = Math.min(Math.max(firstSelectedIndex, 0), unselectedCards.length)
+              const hand = [
+                ...unselectedCards.slice(0, insertIndex),
+                ...selectedGroupCards,
+                ...unselectedCards.slice(insertIndex),
+              ]
+              const handGroups = [
+                ...pruneHandGroups(player.handGroups, hand).filter(
+                  (group) => !group.cardIds.some((cardId) => selectedCardIds.has(cardId)),
+                ),
+                createHandGroup('manual', selectedGroupCards),
+              ]
+
+              return {
+                ...player,
+                hand,
+                handGroups,
+              }
+            })()
+          : player,
+      ),
+      newlyDrawnCardId: null,
+    }))
+  }
+
+  function moveDraggedCard(targetCardId) {
+    if (!draggedCardId || draggedCardId === targetCardId) return
+
+    setGameState((previousState) => ({
+      ...previousState,
+      players: previousState.players.map((player, playerIndex) =>
+        playerIndex === myPlayerIndex
+          ? (() => {
+              const hand = moveCardInHand(player.hand, draggedCardId, targetCardId)
+
+              return {
+                ...player,
+                hand,
+                handGroups: pruneHandGroups(player.handGroups, hand),
+              }
+            })()
+          : player,
+      ),
+      newlyDrawnCardId: null,
+    }))
+    setDraggedCardId(null)
+  }
+
   return (
     <main className="game-shell">
-      <section className="table" aria-label="Tongits card table">
+      <div className={`game-layout ${appMode === 'solo' || multiplayerDealStarted ? 'with-sidebar' : 'table-only'}`}>
+        {(appMode === 'solo' || multiplayerDealStarted) && (
+          <aside className="game-sidebar" aria-label="Player status and game log">
+            <section className="sidebar-card" aria-label="Current table status">
+              <div>
+                <span>Identity</span>
+                <strong>{playerName || 'Player 1'}</strong>
+              </div>
+              <div>
+                <span>Selected</span>
+                <strong>{selectedCardData.labels.length ? selectedCardData.labels.join(' ') : 'None'}</strong>
+              </div>
+              <div>
+                <span>Deadwood</span>
+                <strong>{calculateDeadwood(humanPlayer.hand)}</strong>
+              </div>
+              <div>
+                <span>{appMode === 'solo' ? 'Tracked' : 'Known'}</span>
+                <strong>{conservationStatus.isValid ? '52/52' : `${conservationStatus.totalCards}/52`}</strong>
+              </div>
+            </section>
+
+            <section className="sidebar-card score-stack" aria-label="Player scores">
+              {gameState.players.map((player, playerIndex) => (
+                <div className={player.seatIndex === gameState.currentPlayerIndex ? 'active-score' : ''} key={player.name}>
+                  <span>{player.name}</span>
+                  <strong>{playerIndex === myPlayerIndex ? calculateDeadwood(player.hand) : 'Hidden'}</strong>
+                </div>
+              ))}
+            </section>
+
+            <section className="sidebar-card log-stack" aria-label="Game log">
+              <span>Game Log</span>
+              <div>
+                {gameState.log.map((entry, index) => (
+                  <p key={`${entry}-${index}`}>{entry}</p>
+                ))}
+              </div>
+            </section>
+          </aside>
+        )}
+
+        <section className="table" aria-label="Tongits card table">
         <header className="room-bar">
           <span className="room-label">Room Code</span>
           <strong>{roomCode}</strong>
@@ -995,131 +1549,167 @@ function TongitsGame({
           </section>
         ) : (
           <>
-
-        {gameState.players
-          .filter((_, playerIndex) => playerIndex !== myPlayerIndex)
-          .map((player, offset) => (
-          <section className={`seat opponent opponent-${offset === 0 ? 'left' : 'right'}`} key={player.name}>
-            <div className="avatar">{player.name.replace('Player ', 'P')}</div>
-            <div>
-              <p>{player.name}</p>
-              <span>Hidden hand</span>
-              <div className="opponent-card-backs" aria-label={`${player.name} hidden cards`}>
-                <i />
-                <i />
-                <i />
-              </div>
-              <div className="seat-flags">
-                {player.isOpened && <b>Opened</b>}
-                {player.isSapawed && <b>Sapawed</b>}
-                {player.isBurned && <b>Burned</b>}
-              </div>
-            </div>
-          </section>
-          ))}
-
-        <section className="commons" aria-label="Commons area">
-          <div className="turn-indicator">
-            <span>{gameState.phase === 'gameOver' ? 'Game Over' : `Phase: ${gameState.phase}`}</span>
-            <strong>{currentPlayer.name}</strong>
-          </div>
-
-          <div className="pile-row">
-            <button
-              className="pile draw-pile"
-              disabled={!isHumanTurn || gameState.phase !== 'preDraw'}
-              onClick={() => commitGameState((previousState) => drawFromStock(previousState, myPlayerIndex), 'draw-stock')}
-              type="button"
-            >
-              <span className="card-back"></span>
-              <span className="pile-title">Stock Pile</span>
-              <strong>{gameState.stockPile.length}</strong>
-            </button>
-
-            <button
-              className="pile discard-pile"
-              disabled={!isHumanTurn || gameState.phase !== 'preDraw' || !topDiscard}
-              onClick={() => commitGameState((previousState) => drawFromDiscard(previousState, myPlayerIndex), 'draw-discard')}
-              type="button"
-            >
-              {topDiscard ? (
-                <div className={`card discard-card ${isRedSuit(topDiscard) ? 'red' : 'black'}`}>
-                  <span>{topDiscard.rank}</span>
-                  <strong>{topDiscard.suit}</strong>
+        <section className="board-grid" aria-label="Opponent and commons area">
+          <section className="board-sector opponent-sector" aria-label="Player 2 area">
+            {opponentPlayers[0] && (
+              <section className="seat opponent" key={opponentPlayers[0].name}>
+                <div className="avatar">{opponentPlayers[0].name.replace('Player ', 'P')}</div>
+                <div>
+                  <p>{opponentPlayers[0].name}</p>
+                  <span>Hidden hand</span>
+                  <div className="opponent-card-backs" aria-label={`${opponentPlayers[0].name} hidden cards`}>
+                    <i />
+                    <i />
+                    <i />
+                  </div>
+                  <div className="seat-flags">
+                    {opponentPlayers[0].isOpened && <b>Opened</b>}
+                    {opponentPlayers[0].isSapawed && <b>Sapawed</b>}
+                    {opponentPlayers[0].isBurned && <b>Burned</b>}
+                  </div>
                 </div>
-              ) : (
-                <div className="empty-discard">Empty</div>
-              )}
-              <span className="pile-title">Discard Pile</span>
-              <strong>{gameState.discardPile.length}</strong>
-            </button>
-          </div>
+              </section>
+            )}
+          </section>
 
-          <div className="action-panel">
-            <button
-              disabled={!isHumanTurn || gameState.phase !== 'preDraw' || !canCallDraw(humanPlayer)}
-              onClick={() => commitGameState((previousState) => callDraw(previousState, myPlayerIndex), 'call-draw')}
-              type="button"
+          <section className="commons" aria-label="Commons area">
+            <div className="turn-indicator">
+              <span>{gameState.phase === 'gameOver' ? 'Game Over' : `Phase: ${gameState.phase}`}</span>
+              <strong>{currentPlayer.name}</strong>
+            </div>
+
+            <div
+              className={`turn-timer ${turnSeconds <= 10 ? 'danger' : ''}`}
+              style={{ '--timer-progress': `${(turnSeconds / TURN_SECONDS) * 100}%` }}
             >
+              <span>Turn Timer</span>
+              <strong>{turnSeconds}s</strong>
+              <i />
+            </div>
+
+            <div className="pile-row">
+              <button
+                className="pile draw-pile"
+                disabled={!isHumanTurn || gameState.phase !== 'preDraw'}
+                onClick={() => commitGameState((previousState) => drawFromStock(previousState, myPlayerIndex), 'draw-stock')}
+                type="button"
+              >
+                <span className="card-back"></span>
+                <span className="pile-title">Stock Pile</span>
+                <strong>{gameState.stockPile.length}</strong>
+              </button>
+
+              <button
+                className="pile discard-pile"
+                disabled={!isHumanTurn || gameState.phase !== 'preDraw' || !topDiscard}
+                onClick={() => commitGameState((previousState) => drawFromDiscard(previousState, myPlayerIndex), 'draw-discard')}
+                type="button"
+              >
+                {topDiscard ? (
+                  <div className={`card discard-card ${isRedSuit(topDiscard) ? 'red' : 'black'}`}>
+                    <span>{topDiscard.rank}</span>
+                    <strong>{topDiscard.suit}</strong>
+                  </div>
+                ) : (
+                  <div className="empty-discard">Empty</div>
+                )}
+                <span className="pile-title">Discard Pile</span>
+                <strong>{gameState.discardPile.length}</strong>
+              </button>
+            </div>
+
+            <p className="status-message">{gameState.message}</p>
+          </section>
+
+          <section className="board-sector right-sector" aria-label="Player 3 and exposed melds">
+            {opponentPlayers[1] && (
+              <section className="seat opponent" key={opponentPlayers[1].name}>
+                <div className="avatar">{opponentPlayers[1].name.replace('Player ', 'P')}</div>
+                <div>
+                  <p>{opponentPlayers[1].name}</p>
+                  <span>Hidden hand</span>
+                  <div className="opponent-card-backs" aria-label={`${opponentPlayers[1].name} hidden cards`}>
+                    <i />
+                    <i />
+                    <i />
+                  </div>
+                  <div className="seat-flags">
+                    {opponentPlayers[1].isOpened && <b>Opened</b>}
+                    {opponentPlayers[1].isSapawed && <b>Sapawed</b>}
+                    {opponentPlayers[1].isBurned && <b>Burned</b>}
+                  </div>
+                </div>
+              </section>
+            )}
+
+            <section className="meld-board" aria-label="Exposed melds">
+              {gameState.players.map((player, playerIndex) => (
+                <div className="meld-owner" key={player.name}>
+                  <h2>{player.name} Melds</h2>
+                  {player.exposedMelds.length === 0 ? (
+                    <p>No exposed melds</p>
+                  ) : (
+                    player.exposedMelds.map((meld, meldIndex) => (
+                      <button
+                        className="meld-row"
+                        disabled={!isHumanTurn || gameState.phase !== 'meld' || gameState.selectedCardIds.length !== 1}
+                        key={`${player.name}-${meldIndex}`}
+                        onClick={() =>
+                          commitGameState(
+                            (previousState) => sapawSelectedCard(previousState, playerIndex, meldIndex),
+                            'sapaw',
+                          )
+                        }
+                        type="button"
+                      >
+                        {meld.map((card) => (
+                          <MiniCard card={card} key={card.id} />
+                        ))}
+                        <span>Sapaw</span>
+                      </button>
+                    ))
+                  )}
+                </div>
+              ))}
+            </section>
+          </section>
+        </section>
+
+        <section className="action-bar" aria-label="Game actions">
+          <button disabled={gameState.discardPile.length === 0} onClick={openDiscardHistory} type="button">
+            View Discards
+          </button>
+          <button disabled={!isHumanTurn} onClick={autoSortHand} type="button">
+            Auto-Sort
+          </button>
+          {canGroupSelection && (
+            <button onClick={groupSelectedCards} type="button">
+              Group Selected
+            </button>
+          )}
+          {isHumanTurn && gameState.phase === 'preDraw' && canCallDraw(humanPlayer) && (
+            <button onClick={() => commitGameState((previousState) => callDraw(previousState, myPlayerIndex), 'call-draw')} type="button">
               Call Draw
             </button>
+          )}
+          {selectedCards.length > 0 && (
             <button
-              disabled={!isHumanTurn || gameState.phase !== 'meld' || !selectedMeldStatus.valid}
+              disabled={!canExposeSelection}
               onClick={() => commitGameState((previousState) => exposeSelectedMeld(previousState, myPlayerIndex), 'meld')}
               type="button"
             >
               Expose Meld
             </button>
+          )}
+          {gameState.selectedCardIds.length === 1 && (
             <button
-              disabled={!isHumanTurn || gameState.phase !== 'meld' || gameState.selectedCardIds.length !== 1}
+              disabled={!canDiscardSelection}
               onClick={() => commitGameState((previousState) => discardSelectedCard(previousState, myPlayerIndex), 'discard')}
               type="button"
             >
               Discard Selected
             </button>
-          </div>
-
-          <p className="status-message">{gameState.message}</p>
-        </section>
-
-        <aside className="scoreboard" aria-label="Player scores">
-          {gameState.players.map((player, playerIndex) => (
-            <div className={player.seatIndex === gameState.currentPlayerIndex ? 'active-score' : ''} key={player.name}>
-              <span>{player.name}</span>
-              <strong>{playerIndex === myPlayerIndex ? calculateDeadwood(player.hand) : 'Hidden'}</strong>
-            </div>
-          ))}
-        </aside>
-
-        <section className="meld-board" aria-label="Exposed melds">
-          {gameState.players.map((player, playerIndex) => (
-            <div className="meld-owner" key={player.name}>
-              <h2>{player.name} Melds</h2>
-              {player.exposedMelds.length === 0 ? (
-                <p>No exposed melds</p>
-              ) : (
-                player.exposedMelds.map((meld, meldIndex) => (
-                  <button
-                    className="meld-row"
-                    disabled={!isHumanTurn || gameState.phase !== 'meld' || gameState.selectedCardIds.length !== 1}
-                    key={`${player.name}-${meldIndex}`}
-                    onClick={() =>
-                      commitGameState(
-                        (previousState) => sapawSelectedCard(previousState, playerIndex, meldIndex),
-                        'sapaw',
-                      )
-                    }
-                    type="button"
-                  >
-                    {meld.map((card) => (
-                      <MiniCard card={card} key={card.id} />
-                    ))}
-                    <span>Sapaw</span>
-                  </button>
-                ))
-              )}
-            </div>
-          ))}
+          )}
         </section>
 
         {gameState.winner && (
@@ -1133,43 +1723,46 @@ function TongitsGame({
         )}
 
         <section className="player-seat" aria-label="Your hand">
-          <div className="player-status">
-            <div>
-              <span>You are</span>
-              <strong>{playerName || 'Player 1'}</strong>
-            </div>
-            <div>
-              <span>Selected</span>
-              <strong>{selectedCards.length ? selectedCards.map(formatCard).join(' ') : 'None'}</strong>
-            </div>
-            <div>
-              <span>Deadwood</span>
-              <strong>{calculateDeadwood(humanPlayer.hand)}</strong>
-            </div>
-          </div>
-
-          <div className="hand">
-            {humanPlayer.hand.map((card, index) => (
-              <CardButton
-                card={card}
-                className="hand-card"
-                isSelected={gameState.selectedCardIds.includes(card.id)}
-                key={card.id}
-                onClick={() => toggleSelectedCard(card.id)}
-                style={{ '--card-index': index }}
-              />
+          <div
+            className="hand"
+            style={{
+              '--card-scale': handScale,
+              '--hand-overlap': `${handOverlap}px`,
+            }}
+          >
+            {handRenderGroups.map((group) => (
+              <div className={`hand-group ${group.type}`} key={group.id}>
+                {group.cards.map((card, index) => (
+                  <CardButton
+                    card={card}
+                    className={`hand-card ${gameState.newlyDrawnCardId === card.id ? 'newly-drawn' : ''}`}
+                    draggable
+                    isSelected={gameState.selectedCardIds.includes(card.id)}
+                    key={card.id}
+                    onClick={() => toggleSelectedCard(card.id)}
+                    onDragEnd={() => setDraggedCardId(null)}
+                    onDragOver={(event) => event.preventDefault()}
+                    onDragStart={(event) => {
+                      setDraggedCardId(card.id)
+                      event.dataTransfer.effectAllowed = 'move'
+                    }}
+                    onDrop={(event) => {
+                      event.preventDefault()
+                      moveDraggedCard(card.id)
+                    }}
+                    style={{ '--card-index': index }}
+                  />
+                ))}
+              </div>
             ))}
           </div>
         </section>
 
-        <aside className="game-log" aria-label="Game log">
-          {gameState.log.map((entry) => (
-            <p key={entry}>{entry}</p>
-          ))}
-        </aside>
+        <DiscardHistoryModal cards={discardHistorySnapshot} onClose={closeDiscardHistory} />
           </>
         )}
       </section>
+      </div>
     </main>
   )
 }
