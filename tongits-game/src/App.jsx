@@ -78,6 +78,39 @@ function createDeck() {
   )
 }
 
+function createDealId() {
+  return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`
+}
+
+function assertUniqueCardIds(cards, context) {
+  const duplicateIds = cards
+    .map((card) => card.id)
+    .filter((cardId, index, cardIds) => cardIds.indexOf(cardId) !== index)
+
+  if (duplicateIds.length > 0) {
+    throw new Error(`${context} contains duplicate cards: ${[...new Set(duplicateIds)].join(', ')}`)
+  }
+}
+
+function addUniqueCardToHand(hand, card) {
+  if (hand.some((heldCard) => heldCard.id === card.id)) return sortCards(hand)
+
+  return sortCards([...hand, card])
+}
+
+function normalizeUniqueCards(cards) {
+  const seenCardIds = new Set()
+
+  return sortCards(
+    cards.filter((card) => {
+      if (seenCardIds.has(card.id)) return false
+
+      seenCardIds.add(card.id)
+      return true
+    }),
+  )
+}
+
 function shuffle(cards) {
   const shuffled = [...cards]
 
@@ -120,13 +153,21 @@ function createPlayer(name, seatIndex) {
 
 function buildNewGame() {
   const deck = shuffle(createDeck())
+  assertUniqueCardIds(deck, 'Deck')
+
   const players = PLAYER_NAMES.map(createPlayer)
 
   players[0].hand = sortCards(deck.slice(0, 13))
   players[1].hand = sortCards(deck.slice(13, 25))
   players[2].hand = sortCards(deck.slice(25, 37))
 
+  assertUniqueCardIds(
+    [...players[0].hand, ...players[1].hand, ...players[2].hand, ...deck.slice(37)],
+    'Initial deal',
+  )
+
   return {
+    dealId: createDealId(),
     players,
     stockPile: deck.slice(37),
     discardPile: [],
@@ -211,7 +252,7 @@ function mergePublicGameStateWithPrivateHand(currentGameState, publicGameState, 
   }
 }
 
-async function sendPrivateHandToSeat(roomCode, recipientPresenceKey, hand, role) {
+async function sendPrivateHandToSeat(roomCode, recipientPresenceKey, hand, role, dealId) {
   const supabaseClient = getSupabaseClient()
   const privateChannel = supabaseClient.channel(`room:${roomCode}:private:${recipientPresenceKey}`)
 
@@ -227,6 +268,7 @@ async function sendPrivateHandToSeat(roomCode, recipientPresenceKey, hand, role)
   await privateChannel.send({
     event: 'private-hand',
     payload: {
+      dealId,
       hand,
       role,
       sentAt: new Date().toISOString(),
@@ -360,7 +402,7 @@ function drawFromStock(gameState, playerIndex) {
     index === playerIndex
       ? {
           ...player,
-          hand: sortCards([...player.hand, drawnCard]),
+          hand: addUniqueCardToHand(player.hand, drawnCard),
         }
       : player,
   )
@@ -389,7 +431,7 @@ function drawFromDiscard(gameState, playerIndex) {
     index === playerIndex
       ? {
           ...player,
-          hand: sortCards([...player.hand, drawnCard]),
+          hand: addUniqueCardToHand(player.hand, drawnCard),
         }
       : player,
   )
@@ -827,10 +869,10 @@ function TongitsGame({
       setGameState((previousState) => ({
         ...previousState,
         players: previousState.players.map((player, index) =>
-          index === playerIndex
+          index === playerIndex && payload.dealId === previousState.dealId
             ? {
                 ...player,
-                hand: sortCards(payload.hand),
+                hand: normalizeUniqueCards(payload.hand),
               }
             : player,
         ),
@@ -873,6 +915,7 @@ function TongitsGame({
           player.key,
           initialGameState.players[getPlayerIndexFromRole(player.role)].hand,
           player.role,
+          initialGameState.dealId,
         ),
       ),
     )
