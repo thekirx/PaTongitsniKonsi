@@ -89,8 +89,11 @@ function assertUniqueCardIds(cards, context) {
     .filter((cardId, index, cardIds) => cardIds.indexOf(cardId) !== index)
 
   if (duplicateIds.length > 0) {
-    throw new Error(`${context} contains duplicate cards: ${[...new Set(duplicateIds)].join(', ')}`)
+    console.error(`${context} contains duplicate cards: ${[...new Set(duplicateIds)].join(', ')}`)
+    return false
   }
+
+  return true
 }
 
 function addUniqueCardToHand(hand, card) {
@@ -531,16 +534,17 @@ function buildPublicGameState(gameState) {
 
 function mergePublicGameStateWithPrivateHand(currentGameState, publicGameState, viewerPlayerIndexes) {
   const controlledPlayerIndexes = normalizeControlledPlayerIndexes(viewerPlayerIndexes)
+  const isNewDeal = publicGameState.dealId !== currentGameState.dealId
 
   return {
     ...publicGameState,
     selectedCardIds: [],
     players: publicGameState.players.map((player, playerIndex) => ({
       ...player,
-      handGroups: controlledPlayerIndexes.has(playerIndex)
+      handGroups: controlledPlayerIndexes.has(playerIndex) && !isNewDeal
         ? currentGameState.players[playerIndex]?.handGroups ?? []
         : [],
-      hand: controlledPlayerIndexes.has(playerIndex)
+      hand: controlledPlayerIndexes.has(playerIndex) && !isNewDeal
         ? currentGameState.players[playerIndex]?.hand ?? player.hand
         : [],
     })),
@@ -1359,8 +1363,9 @@ function TongitsGame({
       const playerIndex = getPlayerIndexFromRole(payload.role)
       setGameState((previousState) => ({
         ...previousState,
+        dealId: payload.dealId,
         players: previousState.players.map((player, index) =>
-          index === playerIndex && payload.dealId === previousState.dealId
+          index === playerIndex
             ? {
                 ...player,
                 hand: normalizeUniqueCards(payload.hand),
