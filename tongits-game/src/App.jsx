@@ -499,14 +499,20 @@ function moveTopDiscardCardToHand(gameState, playerIndex) {
   }
 }
 
-function maskGameStateForViewer(gameState, viewerPlayerIndex) {
+function normalizeControlledPlayerIndexes(viewerPlayerIndexes) {
+  return new Set(Array.isArray(viewerPlayerIndexes) ? viewerPlayerIndexes : [viewerPlayerIndexes])
+}
+
+function maskGameStateForViewer(gameState, viewerPlayerIndexes) {
+  const visiblePlayerIndexes = normalizeControlledPlayerIndexes(viewerPlayerIndexes)
+
   return {
     ...gameState,
     selectedCardIds: [],
     players: gameState.players.map((player, playerIndex) => ({
       ...player,
-      handGroups: playerIndex === viewerPlayerIndex ? player.handGroups : [],
-      hand: playerIndex === viewerPlayerIndex ? player.hand : [],
+      handGroups: visiblePlayerIndexes.has(playerIndex) ? player.handGroups : [],
+      hand: visiblePlayerIndexes.has(playerIndex) ? player.hand : [],
     })),
   }
 }
@@ -523,19 +529,25 @@ function buildPublicGameState(gameState) {
   }
 }
 
-function mergePublicGameStateWithPrivateHand(currentGameState, publicGameState, viewerPlayerIndex) {
+function mergePublicGameStateWithPrivateHand(currentGameState, publicGameState, viewerPlayerIndexes) {
+  const controlledPlayerIndexes = normalizeControlledPlayerIndexes(viewerPlayerIndexes)
+
   return {
     ...publicGameState,
     selectedCardIds: [],
     players: publicGameState.players.map((player, playerIndex) => ({
       ...player,
-      handGroups: playerIndex === viewerPlayerIndex ? currentGameState.players[playerIndex]?.handGroups ?? [] : [],
-      hand: playerIndex === viewerPlayerIndex ? currentGameState.players[playerIndex]?.hand ?? player.hand : [],
+      handGroups: controlledPlayerIndexes.has(playerIndex)
+        ? currentGameState.players[playerIndex]?.handGroups ?? []
+        : [],
+      hand: controlledPlayerIndexes.has(playerIndex)
+        ? currentGameState.players[playerIndex]?.hand ?? player.hand
+        : [],
     })),
   }
 }
 
-async function sendPrivateHandToSeat(roomCode, recipientPresenceKey, hand, role, dealId) {
+async function sendPrivateHandToSeat(roomCode, recipientPresenceKey, hand, role, dealId, botPlayerIndex) {
   const supabaseClient = getSupabaseClient()
   const privateChannel = supabaseClient.channel(`room:${roomCode}:private:${recipientPresenceKey}`)
 
@@ -554,6 +566,7 @@ async function sendPrivateHandToSeat(roomCode, recipientPresenceKey, hand, role,
       dealId,
       hand,
       role,
+      botPlayerIndex,
       sentAt: new Date().toISOString(),
     },
     type: 'broadcast',
@@ -1138,6 +1151,7 @@ function DiscardHistoryModal({ cards, onClose }) {
 function TongitsGame({
   appMode,
   connectedPlayers,
+  multiplayerBotEnabled,
   multiplayerDealStarted,
   myRole,
   onMultiplayerDealStarted,
@@ -1155,6 +1169,10 @@ function TongitsGame({
 
   const currentPlayer = gameState.players[gameState.currentPlayerIndex]
   const myPlayerIndex = appMode === 'multiplayer' ? getPlayerIndexFromRole(myRole) : HUMAN_INDEX
+  const controlledPlayerIndexes = useMemo(
+    () => [myPlayerIndex, ...(appMode === 'multiplayer' && multiplayerBotEnabled && myRole === 'Player 1' ? [2] : [])],
+    [appMode, multiplayerBotEnabled, myPlayerIndex, myRole],
+  )
   const humanPlayer = gameState.players[myPlayerIndex]
   const selectedCards = useMemo(
     () => getSelectedCards(humanPlayer.hand, gameState.selectedCardIds),
@@ -1189,19 +1207,25 @@ function TongitsGame({
     if (appMode !== 'multiplayer' || !roomChannel) return
     const publicGameState = buildPublicGameState(nextGameState)
 
-    await roomChannel.send({
-      event: 'game-move',
-      payload: {
-        gameState: publicGameState,
-        publicGameState,
-        moveType,
-        playerName,
-        playerRole: myRole,
-        roomCode,
-        sentAt: new Date().toISOString(),
-      },
-      type: 'broadcast',
-    })
+    try {
+      const sendStatus = await roomChannel.send({
+        event: 'game-move',
+        payload: {
+          gameState: publicGameState,
+          publicGameState,
+          moveType,
+          playerName,
+          playerRole: myRole,
+          roomCode,
+          sentAt: new Date().toISOString(),
+        },
+        type: 'broadcast',
+      })
+
+      if (sendStatus !== 'ok') console.error(`Unable to broadcast ${moveType}: ${sendStatus}`)
+    } catch (error) {
+      console.error(`Unable to broadcast ${moveType}.`, error)
+    }
   }, [appMode, myRole, playerName, roomChannel, roomCode])
 
   const commitGameState = useCallback((reducer, moveType) => {
@@ -1255,6 +1279,31 @@ function TongitsGame({
   }, [appMode, gameState])
 
   useEffect(() => {
+    const isHostBotTurn =
+      appMode === 'multiplayer' &&
+      multiplayerBotEnabled &&
+      multiplayerDealStarted &&
+      myRole === 'Player 1' &&
+      gameState.phase !== 'gameOver' &&
+      gameState.currentPlayerIndex === 2
+
+    if (!isHostBotTurn) return undefined
+
+    const timeoutId = window.setTimeout(() => {
+      commitGameState((previousState) => runCpuTurn(previousState), 'computer-turn')
+    }, 850)
+
+    return () => window.clearTimeout(timeoutId)
+  }, [
+    appMode,
+    commitGameState,
+    gameState,
+    multiplayerBotEnabled,
+    multiplayerDealStarted,
+    myRole,
+  ])
+
+  useEffect(() => {
     setTurnSeconds(TURN_SECONDS)
   }, [gameState.currentPlayerIndex, gameState.dealId])
 
@@ -1285,9 +1334,9 @@ function TongitsGame({
 
       const publicGameState = payload.publicGameState ?? buildPublicGameState(payload.gameState)
       setGameState((previousState) =>
-        mergePublicGameStateWithPrivateHand(previousState, publicGameState, myPlayerIndex),
+        mergePublicGameStateWithPrivateHand(previousState, publicGameState, controlledPlayerIndexes),
       )
-      if (payload.moveType === 'initial-deal') onMultiplayerDealStarted()
+      if (payload.moveType === 'initial-deal') onMultiplayerDealStarted(publicGameState.botPlayerIndex === 2)
     }
 
     roomChannel.on('broadcast', { event: 'game-move' }, handleRemoteMove)
@@ -1295,7 +1344,7 @@ function TongitsGame({
     return () => {
       isListening = false
     }
-  }, [appMode, myPlayerIndex, onMultiplayerDealStarted, roomChannel])
+  }, [appMode, controlledPlayerIndexes, onMultiplayerDealStarted, roomChannel])
 
   useEffect(() => {
     if (appMode !== 'multiplayer' || !presenceKey || !roomCode) return undefined
@@ -1319,7 +1368,7 @@ function TongitsGame({
             : player,
         ),
       }))
-      onMultiplayerDealStarted()
+      onMultiplayerDealStarted(payload.botPlayerIndex === 2)
     })
     privateChannel.subscribe()
 
@@ -1329,23 +1378,29 @@ function TongitsGame({
     }
   }, [appMode, onMultiplayerDealStarted, presenceKey, roomCode])
 
-  async function startMultiplayerDeal() {
-    if (appMode !== 'multiplayer' || myRole !== 'Player 1' || connectedPlayers.length !== 3) return
+  async function startMultiplayerDeal(useComputer = multiplayerBotEnabled) {
+    const requiredPlayerCount = useComputer ? 2 : 3
+    if (appMode !== 'multiplayer' || myRole !== 'Player 1' || connectedPlayers.length !== requiredPlayerCount) return
 
-    const initialGameState = buildNewGame()
-    const visibleInitialState = maskGameStateForViewer(initialGameState, myPlayerIndex)
+    const initialGameState = {
+      ...buildNewGame(),
+      botPlayerIndex: useComputer ? 2 : null,
+    }
+    const locallyControlledIndexes = [myPlayerIndex, ...(useComputer ? [2] : [])]
+    const visibleInitialState = maskGameStateForViewer(initialGameState, locallyControlledIndexes)
 
     setGameState(visibleInitialState)
-    onMultiplayerDealStarted()
+    onMultiplayerDealStarted(useComputer)
     await broadcastGameMove(initialGameState, 'initial-deal')
     await Promise.all(
-      connectedPlayers.map((player) =>
+      connectedPlayers.filter((player) => player.key !== presenceKey).map((player) =>
         sendPrivateHandToSeat(
           roomCode,
           player.key,
           initialGameState.players[getPlayerIndexFromRole(player.role)].hand,
           player.role,
           initialGameState.dealId,
+          initialGameState.botPlayerIndex,
         ),
       ),
     )
@@ -1502,7 +1557,7 @@ function TongitsGame({
             disabled={appMode === 'multiplayer' && myRole !== 'Player 1'}
             onClick={() => {
               if (appMode === 'multiplayer') {
-                startMultiplayerDeal()
+                startMultiplayerDeal(multiplayerBotEnabled)
                 return
               }
 
@@ -1532,18 +1587,18 @@ function TongitsGame({
               {Array.from({ length: Math.max(3 - connectedPlayers.length, 0) }).map((_, index) => (
                 <div className="connected-player empty" key={`empty-seat-${index}`}>
                   <span>{roleForPresenceIndex(connectedPlayers.length + index)}</span>
-                  <strong>Waiting...</strong>
+                  <strong>{connectedPlayers.length === 2 && index === 0 ? 'Waiting or Computer' : 'Waiting...'}</strong>
                 </div>
               ))}
             </div>
-            {connectedPlayers.length === 3 && (
+            {connectedPlayers.length >= 2 && (
               <button
                 className="start-deal-button"
                 disabled={myRole !== 'Player 1'}
-                onClick={startMultiplayerDeal}
+                onClick={() => startMultiplayerDeal(connectedPlayers.length === 2)}
                 type="button"
               >
-                Start Deal
+                {connectedPlayers.length === 2 ? 'Start With Computer' : 'Start Deal'}
               </button>
             )}
           </section>
@@ -1851,6 +1906,7 @@ function App() {
   const [presenceStatus, setPresenceStatus] = useState('Supabase Presence is idle.')
   const [roomChannel, setRoomChannel] = useState(null)
   const [multiplayerDealStarted, setMultiplayerDealStarted] = useState(false)
+  const [multiplayerBotEnabled, setMultiplayerBotEnabled] = useState(false)
   const [isRoomCreator, setIsRoomCreator] = useState(false)
   const [showJoinRoom, setShowJoinRoom] = useState(false)
   const [joinCode, setJoinCode] = useState('')
@@ -1929,7 +1985,7 @@ function App() {
               playerName: playerName.trim(),
               roomCode,
             })
-            setPresenceStatus('Connected. Waiting for all three seats to fill.')
+            setPresenceStatus('Connected. Waiting for players or a two-player start with a computer.')
           }
 
           if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
@@ -1982,6 +2038,7 @@ function App() {
     setRoomCode('SOLO')
     setMyRole('Player 1')
     setIsRoomCreator(false)
+    setMultiplayerBotEnabled(false)
     setAppMode('solo')
   }
 
@@ -1993,6 +2050,7 @@ function App() {
     setIsRoomCreator(true)
     setConnectedPlayers([])
     setMultiplayerDealStarted(false)
+    setMultiplayerBotEnabled(false)
     setAppMode('multiplayer')
   }
 
@@ -2008,6 +2066,7 @@ function App() {
     setIsRoomCreator(false)
     setConnectedPlayers([])
     setMultiplayerDealStarted(false)
+    setMultiplayerBotEnabled(false)
     setAppMode('multiplayer')
   }
 
@@ -2015,7 +2074,13 @@ function App() {
     setAppMode('menu')
     setLobbyError('')
     setMultiplayerDealStarted(false)
+    setMultiplayerBotEnabled(false)
   }
+
+  const handleMultiplayerDealStarted = useCallback((useComputer = false) => {
+    setMultiplayerBotEnabled(useComputer)
+    setMultiplayerDealStarted(true)
+  }, [])
 
   if (appMode === 'menu') {
     return (
@@ -2044,10 +2109,11 @@ function App() {
     <TongitsGame
       appMode={appMode}
       connectedPlayers={connectedPlayers}
+      multiplayerBotEnabled={multiplayerBotEnabled}
       multiplayerDealStarted={multiplayerDealStarted}
       myRole={myRole}
       onExitToMenu={returnToLobby}
-      onMultiplayerDealStarted={() => setMultiplayerDealStarted(true)}
+      onMultiplayerDealStarted={handleMultiplayerDealStarted}
       playerName={playerName}
       presenceStatus={presenceStatus}
       roomCode={roomCode}
